@@ -19,20 +19,23 @@
 #include <sys/zio_checksum.h>
 #include <sys/zio_compress.h>
 #include <sys/kstat.h>
+#include <sys/uzfs_zvol.h>
 #include <libzfs.h>
+#include <uzfs_mgmt.h>
 
 const char *hold_tag = "fio_hold_tag";
 #define HOLD_TAG	((void *) hold_tag)
 
 pthread_mutex_t init_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int initialized_spa[10] = { 0 };
-static int initialized_os[10] = { 0 };
-objset_t *os[10] = { NULL };
+static int initialized_zv[10] = { 0 };
+zvol_state_t *zv[10] = { NULL };
 spa_t *spa[10] = { NULL } ;
 struct dmu_opts {
     void *pad;
     char *pool;
     unsigned int kstats;
+    unsigned int direct;
 };
 
 struct dmu_data {
@@ -77,6 +80,7 @@ pool_import(char *target, boolean_t readonly) {
 
         g_importargs.unique = B_FALSE;
         g_importargs.can_be_active = B_TRUE;
+        g_importargs.scan = B_TRUE;
 
         error = zpool_tryimport(g_zfs, target, &config, &g_importargs);
         if (error)
@@ -118,21 +122,10 @@ fio_dmu_queue(struct thread_data *td, struct io_u *io_u) {
     int error;
     int os_index = (int)((struct dmu_data *)(td->io_ops_data))->os_index;
     if (io_u->ddir == DDIR_WRITE) {
-        dmu_tx_t *tx = dmu_tx_create(os[os_index]);
-        dmu_tx_hold_write(tx, ZVOL_OBJ, io_u->offset, io_u->xfer_buflen);
-        error = dmu_tx_assign(tx, TXG_WAIT);
-        if (error != 0) {
-            dmu_tx_abort(tx);
-            io_u->error = error;
-            td_verror(td, io_u->error, "xfer");
-            return FIO_Q_COMPLETED;
-        }
-        dmu_write(os[os_index], ZVOL_OBJ, io_u->offset, io_u->xfer_buflen, io_u->xfer_buf,
-                  tx);
-        dmu_tx_commit(tx);
+        uzfs_write_data(zv[os_index], io_u->xfer_buf, io_u->offset, io_u->xfer_buflen);
         return FIO_Q_COMPLETED;
     } else if (io_u->ddir == DDIR_READ) {
-        error = dmu_read(os[os_index], ZVOL_OBJ, io_u->offset, io_u->xfer_buflen,
+        error = dmu_read(zv[os_index]->zv_objset, ZVOL_OBJ, io_u->offset, io_u->xfer_buflen,
                          io_u->xfer_buf, DMU_READ_NO_PREFETCH);
         if (error != 0) {
             io_u->error = error;
@@ -149,10 +142,11 @@ static int
 fio_dmu_init(struct thread_data *td) {
     int error = 0;
     struct dmu_opts *opts = td->eo;
-    char *dsname, *c;
+    char *dsname, *c, *ds;
     int i;
     char poolname[MAXPATHLEN];
     char osname[ZFS_MAX_DATASET_NAME_LEN + 1];
+    spa_t *lspa;
 
     dsname = opts->pool;
     /*
@@ -165,6 +159,7 @@ fio_dmu_init(struct thread_data *td) {
     c = strchr(poolname, '/');
     if (c != NULL)
         *c = '\0';
+    ds = ++c;
 
     for (i=0; i<10 && spa[i] != NULL; i++)
     {
@@ -191,18 +186,18 @@ fio_dmu_init(struct thread_data *td) {
 
     spa[i] = user_spa_open(poolname, B_FALSE, HOLD_TAG);
     spa[i]->spa_debug = 1;
-    
+    lspa = spa[i]; 
     initialized_spa[i] = 1;
     td->io_ops_data = (struct dmu_data *)malloc(sizeof(struct dmu_data));
     ((struct dmu_data *)(td->io_ops_data))->spa_index = i;
 
 hold_os:
-    for (i=0; i<10 && os[i] != NULL; i++)
+    for (i=0; i<10 && zv[i] != NULL; i++)
     {
-        dmu_objset_name(os[i], osname);
-	if(strcmp(osname, dsname) == 0)
+        dmu_objset_name(zv[i]->zv_objset, osname);
+        if(strcmp(osname, dsname) == 0)
         {
-            initialized_os[i]++;
+            initialized_zv[i]++;
             ((struct dmu_data *)(td->io_ops_data))->os_index = i;
 	    goto end;
         }
@@ -213,20 +208,19 @@ hold_os:
         pthread_mutex_unlock(&init_mutex);
         exit(1);
     }
-
-    if ((error = dmu_objset_own(dsname, DMU_OST_ZVOL, B_FALSE, HOLD_TAG,
-                                &os[i])) != 0) {
-	printf("No dataset with name %s\n", dsname);
+    zvol_state_t *z;
+    if ((error = uzfs_open_dataset(lspa, ds, opts->direct, &z)) != 0) {
+        printf("No dataset with name %s %s\n", dsname, ds);
         pthread_mutex_unlock(&init_mutex);
         return 1;
     }
-
-    initialized_os[i] = 1;
+    zv[i] = z;
+    initialized_zv[i] = 1;
     ((struct dmu_data *)(td->io_ops_data))->os_index = i;
 end:
     pthread_mutex_unlock(&init_mutex);
 
-    printf("Pool imported %s %s! %d %d %d\n\n\n", dsname, td->o.name, i, td->thread_number, td->subjob_number);
+    printf("Pool imported %s %s! %d %d %d with sync %d\n\n\n", dsname, td->o.name, i, td->thread_number, td->subjob_number, opts->direct);
     return 0;
 }
 
@@ -252,12 +246,12 @@ fio_dmu_close(struct thread_data *td, struct fio_file *f) {
     int spa_index = (int)((struct dmu_data *)(td->io_ops_data))->spa_index;
     int os_index = (int)((struct dmu_data *)(td->io_ops_data))->os_index;
     pthread_mutex_lock(&init_mutex);
-    initialized_os[os_index]--;
-    if(initialized_os[os_index] == 0) {
-         if (opts->kstats != 0) {
-             kstat_dump_all();
-         }
-        dmu_objset_disown(os[os_index], HOLD_TAG);
+    initialized_zv[os_index]--;
+    if(initialized_zv[os_index] == 0) {
+        if (opts->kstats != 0) {
+            kstat_dump_all();
+        }
+        uzfs_close_dataset(zv[os_index]);
     }
     initialized_spa[spa_index]--;
     if(initialized_spa[spa_index] == 0)
@@ -284,6 +278,16 @@ struct fio_option options[] = {{
                                    .def = "0",
                                    .help = "Print kstats when jobs finish",
                                    .off1 = offsetof(struct dmu_opts, kstats),
+                                   .category = FIO_OPT_C_ENGINE,
+                                   .group = FIO_OPT_G_INVALID,
+                               },
+                               {
+                                   .name = "dmu_direct",
+                                   .lname = "dmu_direct",
+                                   .type = FIO_OPT_BOOL,
+                                   .def = "0",
+                                   .help = "dmu_direct",
+                                   .off1 = offsetof(struct dmu_opts, direct),
                                    .category = FIO_OPT_C_ENGINE,
                                    .group = FIO_OPT_G_INVALID,
                                },
