@@ -35,7 +35,6 @@ struct dmu_opts {
     void *pad;
     char *pool;
     unsigned int kstats;
-    unsigned int direct;
 };
 
 struct dmu_data {
@@ -209,7 +208,7 @@ hold_os:
         exit(1);
     }
     zvol_state_t *z;
-    if ((error = uzfs_open_dataset(lspa, ds, opts->direct, &z)) != 0) {
+    if ((error = uzfs_open_dataset(lspa, ds, &z)) != 0) {
         printf("No dataset with name %s %s\n", dsname, ds);
         pthread_mutex_unlock(&init_mutex);
         return 1;
@@ -220,7 +219,7 @@ hold_os:
 end:
     pthread_mutex_unlock(&init_mutex);
 
-    printf("Pool imported %s %s! %d %d %d with sync %d\n\n\n", dsname, td->o.name, i, td->thread_number, td->subjob_number, opts->direct);
+    printf("Pool imported %s %s! %d %d %d\n\n\n", dsname, td->o.name, i, td->thread_number, td->subjob_number);
     return 0;
 }
 
@@ -278,16 +277,6 @@ struct fio_option options[] = {{
                                    .def = "0",
                                    .help = "Print kstats when jobs finish",
                                    .off1 = offsetof(struct dmu_opts, kstats),
-                                   .category = FIO_OPT_C_ENGINE,
-                                   .group = FIO_OPT_G_INVALID,
-                               },
-                               {
-                                   .name = "dmu_direct",
-                                   .lname = "dmu_direct",
-                                   .type = FIO_OPT_BOOL,
-                                   .def = "0",
-                                   .help = "dmu_direct",
-                                   .off1 = offsetof(struct dmu_opts, direct),
                                    .category = FIO_OPT_C_ENGINE,
                                    .group = FIO_OPT_G_INVALID,
                                },
