@@ -10,6 +10,7 @@
 #include <sys/dsl_pool.h>
 #include <sys/dsl_synctask.h>
 #include <sys/fs/zfs.h>
+#include <sys/vdev.h>
 #include <sys/spa.h>
 #include <sys/spa_impl.h>
 #include <sys/vdev.h>
@@ -31,7 +32,7 @@ const char *hold_tag = "fio_hold_tag";
 pthread_mutex_t init_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int initialized_spa[10] = { 0 };
 static int initialized_zv[10] = { 0 };
-zvol_info_t *zvol_info[10] = { NULL };
+zvol_state_t *g_zv[10] = { NULL };
 spa_t *spa[10] = { NULL } ;
 struct dmu_opts {
     void *pad;
@@ -65,6 +66,8 @@ fatal(spa_t *spa, void *tag, const char *fmt, ...) {
     exit(1);
 }
 
+char *pool_dir = "/tmp";
+
 static void
 pool_import(char *target, boolean_t readonly) {
 
@@ -72,6 +75,7 @@ pool_import(char *target, boolean_t readonly) {
         nvlist_t *props;
         int error;
 
+	printf("in pool_import\n");
         g_zfs = libzfs_init();
         ASSERT(g_zfs != NULL);
 
@@ -82,6 +86,12 @@ pool_import(char *target, boolean_t readonly) {
         g_importargs.unique = B_FALSE;
         g_importargs.can_be_active = B_TRUE;
         g_importargs.scan = B_TRUE;
+	g_importargs.path = &pool_dir;
+	g_importargs.paths = 1;
+//        g_importargs.unique = B_TRUE;
+//        g_importargs.scan = B_FALSE;
+//	g_importargs.cachefile = NULL;
+//	g_importargs.poolname = target;
 
         error = zpool_tryimport(g_zfs, target, &config, &g_importargs);
         if (error)
@@ -97,8 +107,8 @@ pool_import(char *target, boolean_t readonly) {
 
         error = spa_import(target, config, props,
             (readonly ?  ZFS_IMPORT_SKIP_MMP : ZFS_IMPORT_NORMAL));
-        if (error == EEXIST)
-                error = 0;
+//        if (error == EEXIST)
+//                error = 0;
 
         if (error)
                 fatal(NULL, FTAG, "can't import '%s': %s", target,
@@ -112,6 +122,7 @@ user_spa_open(char *target, boolean_t readonly, void *tag) {
     spa_t *spa = NULL;
 
     pool_import(target, readonly);
+    printf("pool_import success");
     err = spa_open(target, &spa, tag);
     if (err != 0)
         fatal(NULL, HOLD_TAG, "cannot open '%s': %s", target, strerror(err));
@@ -122,11 +133,15 @@ static int
 fio_dmu_queue(struct thread_data *td, struct io_u *io_u) {
     int error;
     int os_index = (int)((struct dmu_data *)(td->io_ops_data))->os_index;
-    zvol_state_t *zv = zvol_info[os_index]->zv;
+    zvol_state_t *zv = g_zv[os_index];
 
     if (io_u->ddir == DDIR_WRITE) {
-        uzfs_write_data(zv, io_u->xfer_buf, io_u->offset, io_u->xfer_buflen,
-	    NULL);
+        error = uzfs_write_data(zv, io_u->xfer_buf, io_u->offset, io_u->xfer_buflen,
+	    NULL, B_FALSE);
+        if (error != 0) {
+            io_u->error = error;
+            td_verror(td, io_u->error, "rfer");
+        }
         return FIO_Q_COMPLETED;
     } else if (io_u->ddir == DDIR_READ) {
         error = dmu_read(zv->zv_objset, ZVOL_OBJ, io_u->offset, io_u->xfer_buflen,
@@ -143,18 +158,27 @@ fio_dmu_queue(struct thread_data *td, struct io_u *io_u) {
 static int
 fio_dmu_setup(struct thread_data *td) {
     struct dmu_opts *opts = td->eo;
-    char *dsname, *c;
+    char *pooldsname, *dsname, *c;
     int i;
     char poolname[MAXPATHLEN];
     char osname[ZFS_MAX_DATASET_NAME_LEN + 1];
-    zvol_info_t *zinfo;
-
-    dsname = opts->pool;
-    strncpy(poolname, dsname, sizeof(poolname));
+    zvol_state_t *zv;
+    static kernel_inited = 0;
+    int spa_index;
+/*
+    if (kernel_inited == 0) {
+        printf("uzfs initing..\n");
+        uzfs_init();
+        kernel_inited = 1;
+    }
+*/
+    pooldsname = opts->pool;
+    strncpy(poolname, pooldsname, sizeof(poolname));
     c = strchr(poolname, '/');
     if (c != NULL)
         *c = '\0';
-
+    c++;
+    dsname = c;
     for (i=0; i<10 && spa[i] != NULL; i++)
     {
         if(strcmp(spa[i]->spa_name, poolname) == 0)
@@ -177,15 +201,17 @@ fio_dmu_setup(struct thread_data *td) {
     }
 
     spa[i] = user_spa_open(poolname, B_FALSE, HOLD_TAG);
+    printf("spa_open success %s\n", poolname);
     spa[i]->spa_debug = 1;
     initialized_spa[i] = 1;
     td->io_ops_data = (struct dmu_data *)malloc(sizeof(struct dmu_data));
     ((struct dmu_data *)(td->io_ops_data))->spa_index = i;
-
+    spa_index = i;
+    c--;
+    *c = '/';
 hold_os:
-    for (i=0; i<10 && zvol_info[i] != NULL; i++) {
-        dmu_objset_name(((zvol_state_t *) zvol_info[i]->zv)->zv_objset, osname);
-        if(strcmp(osname, dsname) == 0) {
+    for (i=0; i<10 && g_zv[i] != NULL; i++) {
+        if(strcmp(g_zv[i]->zv_name, pooldsname) == 0) {
             initialized_zv[i]++;
             ((struct dmu_data *)(td->io_ops_data))->os_index = i;
 	    goto end;
@@ -196,12 +222,15 @@ hold_os:
         fprintf(stderr, "too many datasets\n");
         exit(1);
     }
-    zinfo = uzfs_zinfo_lookup(dsname);
-    if (zinfo == NULL) {
+    zv = NULL;
+    uzfs_open_dataset(spa[spa_index], dsname, &zv);
+    if (zv == NULL) {
         printf("No zvol info with name %s\n", dsname);
         return 1;
     }
-    zvol_info[i] = zinfo;
+    uzfs_hold_dataset(zv);
+    uzfs_update_metadata_granularity(zv, 512);
+    g_zv[i] = zv;
     initialized_zv[i] = 1;
     ((struct dmu_data *)(td->io_ops_data))->os_index = i;
 end:
@@ -238,8 +267,9 @@ fio_dmu_close(struct thread_data *td, struct fio_file *f) {
     if(initialized_zv[os_index] == 0) {
         if (opts->kstats != 0) {
             kstat_dump_all();
+            spa_print_stats(spa[spa_index]);
         }
-        uzfs_zinfo_drop_refcnt(zvol_info[os_index], 0);
+//        uzfs_zinfo_drop_refcnt(zv[os_index], 0);
     }
     initialized_spa[spa_index]--;
     if(initialized_spa[spa_index] == 0)

@@ -37,7 +37,10 @@ int main(int argc, char *argv[], char *envp[])
 #error "No available clock source!"
 #endif
 
-	kernel_init(FREAD | FWRITE);
+	uzfs_init();
+
+	if (libuzfs_ioctl_init() < 0)
+		return 1;
 
 	if (fio_server_create_sk_key())
 		goto done;
@@ -62,7 +65,7 @@ int main(int argc, char *argv[], char *envp[])
 	} else
 		ret = fio_backend(NULL);
 
-	kernel_fini();
+//	kernel_fini();
 done_key:
 	fio_server_destroy_sk_key();
 done:
